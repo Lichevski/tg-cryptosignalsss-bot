@@ -1,0 +1,179 @@
+import asyncio
+import requests
+from os import getenv
+
+from dotenv import load_dotenv
+from telegram import Bot, KeyboardButton, ReplyKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters
+)
+
+# === Загрузка переменных окружения ===
+load_dotenv()
+TELEGRAM_BOT_TOKEN = getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = getenv("TELEGRAM_CHAT_ID")
+
+if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    print("❌ Убедитесь, что .env содержит TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID")
+    exit()
+
+# === Глобальные переменные ===
+STABLE_COIN = "USDT"
+LOOKBACK_MINUTES = 5
+PRICE_CHANGE_THRESHOLD = 0.10  # 10%
+analysis_task = None
+send_messages = False
+bot = Bot(token=TELEGRAM_BOT_TOKEN)
+
+
+# === Интерфейс клавиатуры ===
+def get_keyboard(start=True):
+    button_text = "Запустить анализ" if start else "Остановить анализ"
+    keyboard = [[KeyboardButton(button_text)]]
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+
+# === Команда /start ===
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Привет😁! Этот бот анализирует рынок на бирже MEXC. Если цена актива изменилась более чем на 10%, бот сигнализирует об этом! Создатель @Lich_discipline💸.",
+        reply_markup=get_keyboard(start=True)
+    )
+
+
+# === Запуск анализа ===
+async def run_script(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global send_messages, analysis_task
+
+    if analysis_task and not analysis_task.done():
+        await update.message.reply_text("Анализ уже запущен, брат:)")
+        return
+
+    send_messages = True
+    await update.message.reply_text(
+        "✅ Анализ успешно запущен! Нажмите 'Остановить анализ' для остановки.",
+        reply_markup=get_keyboard(start=False)
+    )
+
+    analysis_task = asyncio.create_task(analyze_loop())
+
+
+# === Остановка анализа ===
+async def stop_script(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global send_messages, analysis_task
+    send_messages = False
+
+    if analysis_task:
+        analysis_task.cancel()
+        analysis_task = None
+
+    await update.message.reply_text(
+        "✅ Анализ успешно остановлен!",
+        reply_markup=get_keyboard(start=True)
+    )
+
+
+# === Получить все торговые пары с USDT ===
+async def get_all_symbols():
+    url = "https://api.mexc.com/api/v3/exchangeInfo"
+    try:
+        resp = requests.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+        return [s['symbol'] for s in data['symbols'] if s['quoteAsset'] == STABLE_COIN]
+    except Exception as e:
+        print(f"[Ошибка получения символов] {e}")
+        return []
+
+
+# === Исторические цены закрытия ===
+def get_historical_closes(symbol, interval="1m", limit=LOOKBACK_MINUTES):
+    url = f"https://api.mexc.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    try:
+        resp = requests.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+        return [float(kline[4]) for kline in data]
+    except Exception as e:
+        print(f"[Ошибка истории {symbol}] {e}")
+        return None
+
+
+# === Текущая цена ===
+def get_current_price(symbol):
+    url = f"https://api.mexc.com/api/v3/ticker/price?symbol={symbol}"
+    try:
+        resp = requests.get(url)
+        resp.raise_for_status()
+        return round(float(resp.json()['price']), 4)
+    except Exception as e:
+        print(f"[Ошибка цены {symbol}] {e}")
+        return None
+
+
+# === Анализ изменения цены и отправка сигнала ===
+async def analyze_and_alert(symbol):
+    closes = get_historical_closes(symbol)
+    if not closes or len(closes) < 2:
+        return
+
+    start_price = closes[0]
+    current_price = get_current_price(symbol)
+    if not current_price:
+        return
+
+    change = (current_price - start_price) / start_price
+    percent = change * 100
+
+    if abs(change) >= PRICE_CHANGE_THRESHOLD:
+        trend = "📈 LONG" if change > 0 else "📉 SHORT"
+        msg = (
+            f"{trend} сигнал для {symbol}\n"
+            f"Цена: {current_price} ({percent:.2f}%) за {LOOKBACK_MINUTES} мин."
+        )
+        await send_alert(msg)
+
+
+# === Цикл анализа ===
+async def analyze_loop():
+    global send_messages
+    symbols = await get_all_symbols()
+
+    try:
+        while send_messages:
+            for symbol in symbols:
+                await analyze_and_alert(symbol)
+            await asyncio.sleep(60)
+    except asyncio.CancelledError:
+        print("[Анализ остановлен]")
+
+
+# === Отправка сообщения ===
+async def send_alert(text):
+    try:
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+        print(f"[Отправлено] {text}")
+    except Exception as e:
+        print(f"[Ошибка отправки] {e}")
+
+
+# === Запуск приложения ===
+async def main():
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("Запустить анализ"), run_script))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("Остановить анализ"), stop_script))
+
+    print("🤖 Бот запущен. Ожидаю команды.")
+    await app.run_polling()
+
+
+if __name__ == "__main__":
+    import nest_asyncio
+    nest_asyncio.apply()
+    asyncio.get_event_loop().run_until_complete(main())
